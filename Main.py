@@ -3,7 +3,7 @@ from Diffusion.Train import train, eval
 
 def main(model_config = None):
     modelConfig = {
-        "state": "train", # or eval
+        "state": "train", # or   eval
         "epoch": 200,
         "batch_size": 80,
         "T": 1000,
@@ -18,7 +18,7 @@ def main(model_config = None):
         "beta_T": 0.02,
         "img_size": 32,
         "grad_clip": 1.,
-        "device": "cuda:1",
+        "device": "cuda:0",
         "training_load_weight": None,
         "save_weight_dir": "./Checkpoints/",
         "test_load_weight": "ckpt_199_.pt",

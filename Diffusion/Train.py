@@ -13,10 +13,21 @@ from torchvision.utils import save_image
 from Diffusion import GaussianDiffusionSampler, GaussianDiffusionTrainer
 from Diffusion.Model import UNet
 from Scheduler import GradualWarmupScheduler
+import torch.distributed as dist
 
 
 def train(modelConfig: Dict):
-    device = torch.device(modelConfig["device"])
+    # device = torch.device(modelConfig["device"])
+
+    # dist init
+    dist.init_process_group(backend='nccl', init_method='env://')
+    rank = dist.get_rank()
+    size = dist.get_world_size()
+    local_rank = int(os.environ['LOCAL_RANK'])
+    device = torch.device(f"cuda:{local_rank}")
+    # torch.cuda.set_device(device)
+    torch.cuda.set_device(rank % torch.cuda.device_count())
+
     # dataset
     dataset = CIFAR10(
         root='./CIFAR10', train=True, download=True,
@@ -25,12 +36,21 @@ def train(modelConfig: Dict):
             transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ]))
+
+    train_sampler = torch.utils.data.distributed.DistributedSampler(dataset, shuffle=True)
     dataloader = DataLoader(
-        dataset, batch_size=modelConfig["batch_size"], shuffle=True, num_workers=4, drop_last=True, pin_memory=True)
+        dataset, batch_size=modelConfig["batch_size"], num_workers=4, drop_last=True, 
+        pin_memory=True, sampler=train_sampler)
 
     # model setup
     net_model = UNet(T=modelConfig["T"], ch=modelConfig["channel"], ch_mult=modelConfig["channel_mult"], attn=modelConfig["attn"],
-                     num_res_blocks=modelConfig["num_res_blocks"], dropout=modelConfig["dropout"]).to(device)
+                     num_res_blocks=modelConfig["num_res_blocks"], dropout=modelConfig["dropout"])
+
+    # net_model = torch.nn.DataParallel(net_model)
+    net_model.to(device)
+    net_model = torch.nn.parallel.DistributedDataParallel(net_model, device_ids=[local_rank])
+    # net_model.cuda()
+
     if modelConfig["training_load_weight"] is not None:
         net_model.load_state_dict(torch.load(os.path.join(
             modelConfig["save_weight_dir"], modelConfig["training_load_weight"]), map_location=device))
@@ -41,7 +61,11 @@ def train(modelConfig: Dict):
     warmUpScheduler = GradualWarmupScheduler(
         optimizer=optimizer, multiplier=modelConfig["multiplier"], warm_epoch=modelConfig["epoch"] // 10, after_scheduler=cosineScheduler)
     trainer = GaussianDiffusionTrainer(
-        net_model, modelConfig["beta_1"], modelConfig["beta_T"], modelConfig["T"]).to(device)
+        net_model, modelConfig["beta_1"], modelConfig["beta_T"], modelConfig["T"])
+
+    # trainer = torch.nn.DataParallel(trainer)
+    trainer.to(device)
+    # trainer.cuda()
 
     # start training
     for e in range(modelConfig["epoch"]):
@@ -50,7 +74,7 @@ def train(modelConfig: Dict):
                 # train
                 optimizer.zero_grad()
                 x_0 = images.to(device)
-                loss = trainer(x_0).sum() / 1000.
+                loss = trainer(x_0.cuda()).sum() / 1000.
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(
                     net_model.parameters(), modelConfig["grad_clip"])
@@ -62,8 +86,9 @@ def train(modelConfig: Dict):
                     "LR": optimizer.state_dict()['param_groups'][0]["lr"]
                 })
         warmUpScheduler.step()
-        torch.save(net_model.state_dict(), os.path.join(
-            modelConfig["save_weight_dir"], 'ckpt_' + str(e) + "_.pt"))
+        if local_rank == 0:
+            torch.save(net_model.state_dict(), os.path.join(
+                modelConfig["save_weight_dir"], 'ckpt_' + str(e) + "_.pt"))
 
 
 def eval(modelConfig: Dict):
@@ -74,7 +99,7 @@ def eval(modelConfig: Dict):
                      num_res_blocks=modelConfig["num_res_blocks"], dropout=0.)
         ckpt = torch.load(os.path.join(
             modelConfig["save_weight_dir"], modelConfig["test_load_weight"]), map_location=device)
-        model.load_state_dict(ckpt)
+        model.load_state_dict(ckpt,strict=False)
         print("model load weight done.")
         model.eval()
         sampler = GaussianDiffusionSampler(
